@@ -26,14 +26,19 @@ class WgetImageDownloader {
 
     const downloadedImages = [];
     const validExtensions = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg'];
+    const maxConcurrent = 5; // 增加并发数以配合URL并发处理
 
-    for (let i = 0; i < images.length; i++) {
-      const image = images[i];
-      
+    if (images.length === 0) {
+      return downloadedImages;
+    }
+
+    console.log(`⚡ [URL-${urlIndex + 1}] 并发下载 ${images.length} 张图片 (max ${maxConcurrent} concurrent)`);
+    
+    // 创建下载任务函数
+    const downloadImage = async (image, index) => {
       try {
         if (this.imageCache.has(image.fullUrl)) {
-          downloadedImages.push(this.imageCache.get(image.fullUrl));
-          continue;
+          return this.imageCache.get(image.fullUrl);
         }
 
         const url = new URL(image.fullUrl);
@@ -43,55 +48,116 @@ class WgetImageDownloader {
           extension = '.jpg';
         }
 
-        const filename = `image_${urlIndex}_${i}${extension}`;
+        const filename = `image_${urlIndex}_${index}${extension}`;
         const filepath = path.join(this.tempDir, filename);
 
-        console.log(`Downloading image with wget: ${image.fullUrl}`);
+        // console.log(`⬇️  [${urlIndex + 1}] ${filename}: ${image.fullUrl}`); // 减少输出噪音
 
-        // 使用wget下载图片
-        const wgetCmd = [
-          'wget',
-          '--timeout=15',
-          '--tries=2',
-          '--user-agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"',
-          '--no-check-certificate',
-          '--quiet',
-          `--output-document="${filepath}"`,
-          `"${image.fullUrl}"`
-        ].join(' ');
-
-        try {
-          await execAsync(wgetCmd);
+        const downloadCommands = [
+          // First try: Standard wget with SSL fixes
+          [
+            'wget',
+            '--timeout=30',
+            '--tries=3',
+            '--user-agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"',
+            '--no-check-certificate',
+            '--secure-protocol=auto',
+            '--https-only=off',
+            '--quiet',
+            '--max-redirect=5',
+            '--ignore-case',
+            `--output-document="${filepath}"`,
+            `"${image.fullUrl}"`
+          ].join(' '),
           
-          // 检查文件是否成功下载
-          if (await fs.pathExists(filepath)) {
-            const stats = await fs.stat(filepath);
-            if (stats.size > 0) {
-              const imageInfo = {
-                originalSrc: image.originalSrc,
-                fullUrl: image.fullUrl,
-                localPath: filepath,
-                filename: filename,
-                alt: image.alt
-              };
+          // Second try: Disable proxy
+          `env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY wget --timeout=30 --tries=3 --user-agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36" --no-check-certificate --quiet --max-redirect=5 --output-document="${filepath}" "${image.fullUrl}"`,
+          
+          // Third try: Use curl
+          `curl -L --max-time 30 --retry 3 --user-agent "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36" --insecure --max-redirs 5 --silent -o "${filepath}" "${image.fullUrl}"`
+        ];
 
-              this.imageCache.set(image.fullUrl, imageInfo);
-              downloadedImages.push(imageInfo);
-              
-              console.log(`Downloaded: ${filename} (${stats.size} bytes)`);
-            } else {
-              console.warn(`Downloaded image is empty: ${filename}`);
+        let downloadSuccess = false;
+        let lastError = null;
+
+        for (let i = 0; i < downloadCommands.length && !downloadSuccess; i++) {
+          try {
+            await execAsync(downloadCommands[i]);
+            
+            // Check if download was successful
+            if (await fs.pathExists(filepath)) {
+              const stats = await fs.stat(filepath);
+              if (stats.size > 0) {
+                downloadSuccess = true;
+                break;
+              } else {
+                await fs.remove(filepath);
+              }
+            }
+          } catch (error) {
+            lastError = error;
+            // Clean up any partial file
+            if (await fs.pathExists(filepath)) {
               await fs.remove(filepath);
             }
-          } else {
-            console.warn(`Failed to download image: ${image.fullUrl}`);
           }
-        } catch (wgetError) {
-          console.warn(`wget failed for image ${image.fullUrl}:`, wgetError.message);
+        }
+
+        if (!downloadSuccess) {
+          throw lastError || new Error(`All download methods failed for ${image.fullUrl}`);
+        }
+        
+        if (await fs.pathExists(filepath)) {
+          const stats = await fs.stat(filepath);
+          if (stats.size > 0) {
+            const imageInfo = {
+              originalSrc: image.originalSrc,
+              fullUrl: image.fullUrl,
+              localPath: filepath,
+              filename: filename,
+              alt: image.alt
+            };
+
+            this.imageCache.set(image.fullUrl, imageInfo);
+            // console.log(`✅ [${urlIndex + 1}] ${filename} (${(stats.size/1024).toFixed(1)}KB)`); // 减少输出噪音
+            return imageInfo;
+          } else {
+            console.warn(`❌ ${filename}: 文件为空`);
+            await fs.remove(filepath);
+          }
         }
       } catch (error) {
-        console.warn(`Failed to process image ${image.fullUrl}:`, error.message);
+        // console.warn(`❌ [${urlIndex + 1}] 下载失败 ${image.fullUrl}:`, error.message); // 减少输出噪音
       }
+      return null;
+    };
+
+    // 批量并发下载
+    let processedImages = 0;
+    for (let i = 0; i < images.length; i += maxConcurrent) {
+      const batch = images.slice(i, i + maxConcurrent);
+      const batchPromises = batch.map((image, batchIndex) => 
+        downloadImage(image, i + batchIndex)
+      );
+      
+      const results = await Promise.allSettled(batchPromises);
+      let batchSuccessCount = 0;
+      
+      results.forEach(result => {
+        if (result.status === 'fulfilled' && result.value) {
+          downloadedImages.push(result.value);
+          batchSuccessCount++;
+        }
+      });
+      
+      processedImages += batch.length;
+      if (images.length > 5) { // 只有较多图片时才显示进度
+        console.log(`📊 [URL-${urlIndex + 1}] 图片进度: ${processedImages}/${images.length} (成功: ${downloadedImages.length})`);
+      }
+    }
+
+    if (downloadedImages.length > 0) {
+      console.log(`✅ [URL-${urlIndex + 1}] 成功下载 ${downloadedImages.length}/${images.length} 张图片`);
     }
 
     return downloadedImages;
@@ -110,47 +176,30 @@ class WgetImageDownloader {
   async replaceImageSources(html, downloadedImages) {
     let processedHtml = html;
     
+    console.log(`🔄 替换 ${downloadedImages.length} 张图片的路径`);
+    
     for (const image of downloadedImages) {
       try {
-        // 读取图片文件并转换为base64 - 这是最可靠的方法
-        const imageBuffer = await fs.readFile(image.localPath);
-        const extension = path.extname(image.filename).toLowerCase().substring(1);
-        let mimeType = 'image/jpeg';
-        
-        switch (extension) {
-          case 'png': mimeType = 'image/png'; break;
-          case 'gif': mimeType = 'image/gif'; break;
-          case 'jpg': case 'jpeg': mimeType = 'image/jpeg'; break;
-          case 'webp': mimeType = 'image/webp'; break;
-          case 'svg': mimeType = 'image/svg+xml'; break;
-        }
-        
-        const base64Image = `data:${mimeType};base64,${imageBuffer.toString('base64')}`;
-        
-        // 转义特殊字符用于正则表达式
+        const absolutePath = path.resolve(image.localPath);
         const escapedSrc = image.originalSrc.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
         
         // 替换所有可能的src属性格式
         const srcRegex = new RegExp(`src=["']${escapedSrc}["']`, 'gi');
-        processedHtml = processedHtml.replace(srcRegex, `src="${base64Image}"`);
+        processedHtml = processedHtml.replace(srcRegex, `src="${absolutePath}"`);
         
-        // 替换 data-src 属性  
         const dataSrcRegex = new RegExp(`data-src=["']${escapedSrc}["']`, 'gi');
-        processedHtml = processedHtml.replace(dataSrcRegex, `src="${base64Image}"`);
+        processedHtml = processedHtml.replace(dataSrcRegex, `src="${absolutePath}"`);
         
-        // 处理相对路径的情况
         if (image.originalSrc.startsWith('/')) {
           const relativeRegex = new RegExp(`src=["']${image.originalSrc.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}["']`, 'gi');
-          processedHtml = processedHtml.replace(relativeRegex, `src="${base64Image}"`);
+          processedHtml = processedHtml.replace(relativeRegex, `src="${absolutePath}"`);
         }
         
-        console.log(`Converted ${image.filename} to base64 (${(base64Image.length/1024).toFixed(1)}KB)`);
+        const fullUrlRegex = new RegExp(`src=["']${image.fullUrl.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}["']`, 'gi');
+        processedHtml = processedHtml.replace(fullUrlRegex, `src="${absolutePath}"`);
+        
       } catch (error) {
-        console.warn(`Failed to convert image ${image.filename} to base64:`, error.message);
-        // 降级为占位符
-        const escapedSrc = image.originalSrc.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        const srcRegex = new RegExp(`src=["']${escapedSrc}["']`, 'gi');
-        processedHtml = processedHtml.replace(srcRegex, `alt="[${image.alt || 'Image'}]"`);
+        console.warn(`❌ 处理图片失败 ${image.filename}:`, error.message);
       }
     }
     
